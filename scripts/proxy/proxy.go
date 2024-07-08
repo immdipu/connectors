@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/amp-labs/connectors/common"
+	"github.com/amp-labs/connectors/common/paramsbuilder"
 	"github.com/amp-labs/connectors/connector"
 	"github.com/amp-labs/connectors/providers"
 	"github.com/amp-labs/connectors/utils"
@@ -137,13 +138,9 @@ func main() {
 		slog.Warn("no substitutions, ensure that the provider info doesn't have any {{variables}}")
 	}
 
-	// Cast the substitutions to a map[string]string
-	substitutionsMap := make(map[string]string)
-	for key, val := range substitutions {
-		substitutionsMap[key] = val.MustString()
-	}
+	catalogVariables := paramsbuilder.NewCatalogVariables(substitutions)
 
-	info, err := providers.ReadInfo(provider, &substitutionsMap)
+	info, err := providers.ReadInfo(provider, catalogVariables...)
 	if err != nil {
 		log.Fatalf("Error reading provider info: %v", err)
 	}
@@ -164,63 +161,58 @@ func main() {
 
 		switch info.Oauth2Opts.GrantType {
 		case providers.ClientCredentials:
-			mainOAuth2ClientCreds(ctx, provider, substitutionsMap)
+			mainOAuth2ClientCreds(ctx, provider, catalogVariables)
 		case providers.AuthorizationCode:
-			mainOAuth2AuthCode(ctx, provider, substitutionsMap)
+			mainOAuth2AuthCode(ctx, provider, catalogVariables)
+		case providers.Password:
+			// de facto, password grant acts as client credentials,
+			// even so access and refresh tokens were acquired differently.
+			mainOAuth2ClientCreds(ctx, provider, catalogVariables)
 		default:
 			log.Fatalf("Unsupported OAuth2 grant type: %s", info.Oauth2Opts.GrantType)
 		}
 	case providers.ApiKey:
-		mainApiKey(ctx, provider, substitutionsMap)
+		mainApiKey(ctx, provider, catalogVariables)
 	case providers.Basic:
-		mainBasic(ctx, provider, substitutionsMap)
+		mainBasic(ctx, provider, catalogVariables)
 	default:
 		log.Fatalf("Unsupported auth type: %s", info.AuthType)
 	}
 }
 
-func mainOAuth2ClientCreds(ctx context.Context, provider string, substitutionsMap map[string]string) {
-	clientId := registry.MustString("ClientId")
-	clientSecret := registry.MustString("ClientSecret")
-
-	scopes, err := registry.GetString("Scopes")
-	if err != nil {
-		slog.Warn("no scopes attached, ensure that the provider doesn't require scopes")
-	}
-
-	oauthScopes := strings.Split(scopes, ",")
-
-	validateRequiredOAuth2Flags(provider, clientId, clientSecret)
-	startOAuthClientCredsProxy(ctx, provider, oauthScopes, clientId, clientSecret, substitutionsMap, DefaultPort)
-}
-
-func mainOAuth2AuthCode(ctx context.Context, provider string, substitutionsMap map[string]string) {
-	clientId := registry.MustString("ClientId")
-	clientSecret := registry.MustString("ClientSecret")
+func mainOAuth2ClientCreds(ctx context.Context, provider string, catalogVariables []paramsbuilder.CatalogVariable) {
+	params := createClientAuthParams(provider)
 	tokens := getTokensFromRegistry()
-
-	scopes, err := registry.GetString("Scopes")
-	if err != nil {
-		slog.Warn("no scopes attached, ensure that the provider doesn't require scopes")
-	}
-
-	oauthScopes := strings.Split(scopes, ",")
-
-	validateRequiredOAuth2Flags(provider, clientId, clientSecret)
-	startOAuthAuthCodeProxy(ctx, provider, oauthScopes, clientId, clientSecret, substitutionsMap, DefaultPort, tokens)
+	proxy := buildOAuth2AuthCodeProxy(ctx, provider, params.Scopes, params.ID, params.Secret, catalogVariables, tokens)
+	startProxy(ctx, proxy, DefaultPort)
 }
 
-func mainApiKey(ctx context.Context, provider string, substitutionsMap map[string]string) {
+func mainOAuth2AuthCode(ctx context.Context, provider string, catalogVariables []paramsbuilder.CatalogVariable) {
+	params := createClientAuthParams(provider)
+	tokens := getTokensFromRegistry()
+	proxy := buildOAuth2AuthCodeProxy(ctx, provider, params.Scopes, params.ID, params.Secret, catalogVariables, tokens)
+	startProxy(ctx, proxy, DefaultPort)
+}
+
+func mainApiKey(ctx context.Context, provider string, catalogVariables []paramsbuilder.CatalogVariable) {
 	apiKey := registry.MustString("ApiKey")
 	if apiKey == "" {
 		_, _ = fmt.Fprintln(os.Stderr, "api key from registry is empty")
 		os.Exit(1)
 	}
 
-	startApiKeyProxy(ctx, provider, apiKey, substitutionsMap, DefaultPort)
+	proxy := buildApiKeyProxy(ctx, provider, catalogVariables, apiKey)
+	startProxy(ctx, proxy, DefaultPort)
 }
 
-func mainBasic(ctx context.Context, provider string, substitutionsMap map[string]string) {
+func mainBasic(ctx context.Context, provider string, catalogVariables []paramsbuilder.CatalogVariable) {
+	params := createBasicParams()
+
+	proxy := buildBasicAuthProxy(ctx, provider, catalogVariables, params.User, params.Pass)
+	startProxy(ctx, proxy, DefaultPort)
+}
+
+func createBasicParams() *providers.BasicParams {
 	user := registry.MustString("UserName")
 	pass := registry.MustString("Password")
 
@@ -236,7 +228,28 @@ func mainBasic(ctx context.Context, provider string, substitutionsMap map[string
 		slog.Warn("no password for basic authentication, ensure that it is not required")
 	}
 
-	startBasicAuthProxy(ctx, provider, user, pass, substitutionsMap, DefaultPort)
+	return &providers.BasicParams{
+		User: user,
+		Pass: pass,
+	}
+}
+
+func createClientAuthParams(provider string) *ClientAuthParams {
+	clientId := registry.MustString("ClientId")
+	clientSecret := registry.MustString("ClientSecret")
+
+	scopes, err := registry.GetString("Scopes")
+	if err != nil {
+		slog.Warn("no scopes attached, ensure that the provider doesn't require scopes")
+	}
+
+	validateRequiredOAuth2Flags(provider, clientId, clientSecret)
+
+	return &ClientAuthParams{
+		ID:     clientId,
+		Secret: clientSecret,
+		Scopes: strings.Split(scopes, ","),
+	}
 }
 
 // Some connectors may implement Refresh tokens, when it happens expiry must be provided alongside.
@@ -338,8 +351,7 @@ func listen(ctx context.Context, port int) error {
 	return nil
 }
 
-func startOAuthClientCredsProxy(ctx context.Context, provider string, scopes []string, clientId, clientSecret string, substitutions map[string]string, port int) {
-	proxy := buildOAuth2ClientCredentialsProxy(ctx, provider, scopes, clientId, clientSecret, substitutions)
+func startProxy(ctx context.Context, proxy *Proxy, port int) {
 	http.Handle("/", proxy)
 
 	fmt.Printf("\nProxy server listening on :%d\n", port)
@@ -349,41 +361,8 @@ func startOAuthClientCredsProxy(ctx context.Context, provider string, scopes []s
 	}
 }
 
-func startApiKeyProxy(ctx context.Context, provider string, apiKey string, substitutions map[string]string, port int) {
-	proxy := buildApiKeyProxy(ctx, provider, substitutions, apiKey)
-	http.Handle("/", proxy)
-
-	fmt.Printf("\nProxy server listening on :%d\n", port)
-
-	if err := listen(ctx, port); err != nil {
-		panic(err)
-	}
-}
-
-func startBasicAuthProxy(ctx context.Context, provider string, user, pass string, substitutions map[string]string, port int) {
-	proxy := buildBasicAuthProxy(ctx, provider, substitutions, user, pass)
-	http.Handle("/", proxy)
-
-	fmt.Printf("\nProxy server listening on :%d\n", port)
-
-	if err := listen(ctx, port); err != nil {
-		panic(err)
-	}
-}
-
-func startOAuthAuthCodeProxy(ctx context.Context, provider string, scopes []string, clientId, clientSecret string, substitutions map[string]string, port int, tokens *oauth2.Token) {
-	proxy := buildOAuth2AuthCodeProxy(ctx, provider, scopes, clientId, clientSecret, substitutions, tokens)
-	http.Handle("/", proxy)
-
-	fmt.Printf("\nProxy server listening on :%d\n", port)
-
-	if err := listen(ctx, port); err != nil {
-		panic(err)
-	}
-}
-
-func buildOAuth2ClientCredentialsProxy(ctx context.Context, provider string, scopes []string, clientId, clientSecret string, substitutions map[string]string) *Proxy {
-	providerInfo := getProviderConfig(provider, substitutions)
+func buildOAuth2ClientCredentialsProxy(ctx context.Context, provider string, scopes []string, clientId, clientSecret string, catalogVariables []paramsbuilder.CatalogVariable) *Proxy {
+	providerInfo := getProviderConfig(provider, catalogVariables)
 	cfg := configureOAuthClientCredentials(clientId, clientSecret, scopes, providerInfo)
 	httpClient := setupOAuth2ClientCredentialsHttpClient(ctx, providerInfo, cfg)
 
@@ -395,8 +374,8 @@ func buildOAuth2ClientCredentialsProxy(ctx context.Context, provider string, sco
 	return newProxy(target, httpClient)
 }
 
-func buildApiKeyProxy(ctx context.Context, provider string, substitutions map[string]string, apiKey string) *Proxy {
-	providerInfo := getProviderConfig(provider, substitutions)
+func buildApiKeyProxy(ctx context.Context, provider string, catalogVariables []paramsbuilder.CatalogVariable, apiKey string) *Proxy {
+	providerInfo := getProviderConfig(provider, catalogVariables)
 	httpClient := setupApiKeyHttpClient(ctx, providerInfo, apiKey)
 
 	target, err := url.Parse(providerInfo.BaseURL)
@@ -407,8 +386,8 @@ func buildApiKeyProxy(ctx context.Context, provider string, substitutions map[st
 	return newProxy(target, httpClient)
 }
 
-func buildBasicAuthProxy(ctx context.Context, provider string, substitutions map[string]string, user, pass string) *Proxy {
-	providerInfo := getProviderConfig(provider, substitutions)
+func buildBasicAuthProxy(ctx context.Context, provider string, catalogVariables []paramsbuilder.CatalogVariable, user, pass string) *Proxy {
+	providerInfo := getProviderConfig(provider, catalogVariables)
 	httpClient := setupBasicAuthHttpClient(ctx, providerInfo, user, pass)
 
 	target, err := url.Parse(providerInfo.BaseURL)
@@ -419,8 +398,8 @@ func buildBasicAuthProxy(ctx context.Context, provider string, substitutions map
 	return newProxy(target, httpClient)
 }
 
-func buildOAuth2AuthCodeProxy(ctx context.Context, provider string, scopes []string, clientId, clientSecret string, substitutions map[string]string, tokens *oauth2.Token) *Proxy {
-	providerInfo := getProviderConfig(provider, substitutions)
+func buildOAuth2AuthCodeProxy(ctx context.Context, provider string, scopes []string, clientId, clientSecret string, catalogVariables []paramsbuilder.CatalogVariable, tokens *oauth2.Token) *Proxy {
+	providerInfo := getProviderConfig(provider, catalogVariables)
 	cfg := configureOAuthAuthCode(clientId, clientSecret, scopes, providerInfo)
 	httpClient := setupOAuth2AuthCodeHttpClient(ctx, providerInfo, cfg, tokens)
 
@@ -432,8 +411,8 @@ func buildOAuth2AuthCodeProxy(ctx context.Context, provider string, scopes []str
 	return newProxy(target, httpClient)
 }
 
-func getProviderConfig(provider string, substitutions map[string]string) *providers.ProviderInfo {
-	config, err := providers.ReadInfo(provider, &substitutions)
+func getProviderConfig(provider string, catalogVariables []paramsbuilder.CatalogVariable) *providers.ProviderInfo {
+	config, err := providers.ReadInfo(provider, catalogVariables...)
 	if err != nil {
 		panic(fmt.Errorf("%w: %s", err, provider))
 	}
@@ -452,12 +431,18 @@ func configureOAuthClientCredentials(clientId, clientSecret string, scopes []str
 		cfg.Scopes = scopes
 	}
 
-	if providerInfo.Oauth2Opts.Audience != "" {
+	if providerInfo.Oauth2Opts.Audience != nil {
 		aud := providerInfo.Oauth2Opts.Audience
-		cfg.EndpointParams = url.Values{"audience": {aud}}
+		cfg.EndpointParams = url.Values{"audience": aud}
 	}
 
 	return cfg
+}
+
+type ClientAuthParams struct {
+	ID     string
+	Secret string
+	Scopes []string
 }
 
 func configureOAuthAuthCode(clientId, clientSecret string, scopes []string, providerInfo *providers.ProviderInfo) *oauth2.Config {
