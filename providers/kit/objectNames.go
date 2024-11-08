@@ -19,4 +19,19 @@ var supportedObjectsByRead = datautils.NewSet( //nolint:gochecknoglobals
 	objectNameCustomFields,
 	objectNameEmailTemplates,
 	objectNameTags,
+	objectNameForms,
+	objectNamePurchases,
+	objectNameSequences,
+	objectNameSegments,
+	objectNameSubscribers,
+	objectNameWebhooks,
+)
+
+var supportedObjectsByWrite = datautils.NewSet( //nolint:gochecknoglobals
+	objectNameBroadcasts,
+	objectNameCustomfields,
+	objectNameSubscribers,
+	objectNameTags,
+	objectNamePurchases,
+	objectNameWebhooks,
 )
