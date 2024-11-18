@@ -28,8 +28,8 @@ var supportedObjectsByRead = datautils.NewSet( //nolint:gochecknoglobals
 )
 
 var supportedObjectsByWrite = datautils.NewSet( //nolint:gochecknoglobals
-	objectNameBroadcasts,
-	objectNameCustomfields,
+	objectNameBroadCasts,
+	objectNameCustomFields,
 	objectNameSubscribers,
 	objectNameTags,
 	objectNamePurchases,
