@@ -28,7 +28,7 @@ func DataObjectLocator(objectName, fieldName string) bool {
 //
 // Ex:
 //
-//	CustomMappingObjectCheck(handy.NewDefaultMap(map[string]string{
+//	CustomMappingObjectCheck(datautils.NewDefaultMap(map[string]string{
 //			"orders":	"orders",
 //			"carts":	"carts",
 //			"coupons":	"coupons",
@@ -57,8 +57,13 @@ func CamelCaseToSpaceSeparated(displayName string) string {
 	return strcase.ToDelimited(displayName, ' ')
 }
 
-// ParameterFilterGetMethod callback that filters REST operations based on endpoint parameters.
-type ParameterFilterGetMethod func(objectName string, operation *openapi3.Operation) bool
+// Pluralize will apply pluralization to the display name.
+func Pluralize(displayName string) string {
+	return naming.NewPluralString(displayName).String()
+}
+
+// ReadOperationMethodFilter callback that filters REST operations based on endpoint parameters.
+type ReadOperationMethodFilter func(objectName string, operation *openapi3.Operation) bool
 
 // OnlyOptionalQueryParameters operation must include only optional query parameters.
 func OnlyOptionalQueryParameters(objectName string, operation *openapi3.Operation) bool {
@@ -72,9 +77,28 @@ func OnlyOptionalQueryParameters(objectName string, operation *openapi3.Operatio
 	return true
 }
 
+// PropertyFlattener is used to inherit fields from nested object moving them to the top level.
+// Ex:
+//
+//	{
+//		"a":1,
+//		"b":2,
+//		"grouping": {
+//			"c":3,
+//			"d":4,
+//		},
+//		"e":5
+//	}
+//
+// If we return true on "grouping" fieldName then it will be flattened with the resulting
+// list of fields becoming "a", "b", "c", "d", "e".
+type PropertyFlattener func(objectName, fieldName string) bool
+
 type parameters struct {
 	displayPostProcessing DisplayNameProcessor
-	parameterFilter       ParameterFilterGetMethod
+	operationMethodFilter ReadOperationMethodFilter
+	propertyFlattener     PropertyFlattener
+	mediaType             string
 }
 
 type Option = func(params *parameters)
@@ -83,6 +107,30 @@ func createParams(opts []Option) *parameters {
 	var params parameters
 	for _, opt := range opts {
 		opt(&params)
+	}
+
+	// Default values are setup here.
+
+	if params.displayPostProcessing == nil {
+		params.displayPostProcessing = func(displayName string) string {
+			return displayName
+		}
+	}
+
+	if params.operationMethodFilter == nil {
+		params.operationMethodFilter = func(objectName string, operation *openapi3.Operation) bool {
+			return true
+		}
+	}
+
+	if params.propertyFlattener == nil {
+		params.propertyFlattener = func(objectName, fieldName string) bool {
+			return false
+		}
+	}
+
+	if len(params.mediaType) == 0 {
+		params.mediaType = "application/json"
 	}
 
 	return &params
@@ -103,8 +151,26 @@ func WithDisplayNamePostProcessors(processors ...DisplayNameProcessor) Option {
 
 // WithParameterFilterGetMethod adds custom callback to decide
 // if GET operation should be included based on parameters definitions.
-func WithParameterFilterGetMethod(parameterFilter ParameterFilterGetMethod) Option {
+func WithParameterFilterGetMethod(parameterFilter ReadOperationMethodFilter) Option {
 	return func(params *parameters) {
-		params.parameterFilter = parameterFilter
+		params.operationMethodFilter = parameterFilter
+	}
+}
+
+// WithMediaType picks which media type which should be used when searching schemas in API response.
+// By default, schema is expected to be under "application/json" media response.
+func WithMediaType(mediaType string) Option {
+	return func(params *parameters) {
+		params.mediaType = mediaType
+	}
+}
+
+// WithPropertyFlattening allows nested fields to be moved to the top level.
+// There are some APIs that hold fields of interest under grouping object, the nested object.
+// This configuration flattens response schema fields.
+// Please, have a look at PropertyFlattener documentation.
+func WithPropertyFlattening(propertyFlattener PropertyFlattener) Option {
+	return func(params *parameters) {
+		params.propertyFlattener = propertyFlattener
 	}
 }

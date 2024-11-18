@@ -39,6 +39,7 @@ type Schema struct {
 	Fields      []string
 	QueryParams []string
 	URLPath     string
+	ResponseKey string
 	Problem     error
 }
 
@@ -67,23 +68,24 @@ func (s Schema) String() string {
 
 func (p PathItem) RetrieveSchemaOperation(
 	operationName string,
-	displayNameOverride map[string]string, locator ObjectArrayLocator, displayProcessor DisplayNameProcessor,
-	parameterFilter ParameterFilterGetMethod,
+	displayNameOverride map[string]string,
+	locator ObjectArrayLocator,
+	displayProcessor DisplayNameProcessor,
+	operationMethodFilter ReadOperationMethodFilter,
+	propertyFlattener PropertyFlattener,
+	mime string,
 ) (*Schema, bool, error) {
 	operation := p.selectOperation(operationName)
 	if operation == nil {
 		return nil, false, nil
 	}
 
-	if parameterFilter != nil {
-		ok := parameterFilter(p.objectName, operation)
-		if !ok {
-			// Omit this schema. We only work with GET method without required parameters
-			return nil, false, nil
-		}
+	if ok := operationMethodFilter(p.objectName, operation); !ok {
+		// Omit this schema, operation for this object is not what we are looking for.
+		return nil, false, nil
 	}
 
-	schema := extractSchema(operation)
+	schema := extractSchema(operation, mime)
 	if schema == nil {
 		return nil, false, nil
 	}
@@ -95,13 +97,11 @@ func (p PathItem) RetrieveSchemaOperation(
 			displayName = p.objectName
 		}
 
-		if displayProcessor != nil {
-			// Post process Display Names to have shared format.
-			displayName = displayProcessor(displayName)
-		}
+		// Post process Display Names to have shared format.
+		displayName = displayProcessor(displayName)
 	}
 
-	fields, err := extractObjectFields(p.objectName, schema, locator)
+	fields, responseKey, err := extractObjectFields(p.objectName, schema, locator, propertyFlattener)
 
 	return &Schema{
 		ObjectName:  p.objectName,
@@ -109,6 +109,7 @@ func (p PathItem) RetrieveSchemaOperation(
 		Fields:      fields,
 		QueryParams: getQueryParameters(operation),
 		URLPath:     p.urlPath,
+		ResponseKey: responseKey,
 		Problem:     err,
 	}, true, nil
 }
@@ -126,19 +127,22 @@ func (p PathItem) selectOperation(operationName string) *openapi3.Operation {
 	}
 }
 
-func extractObjectFields(objectName string, schema *openapi3.Schema, locator ObjectArrayLocator) ([]string, error) {
+func extractObjectFields(
+	objectName string, schema *openapi3.Schema, locator ObjectArrayLocator,
+	propertyFlattener PropertyFlattener,
+) (fields []string, location string, err error) {
 	switch getSchemaType(schema) {
 	case schemaTypeObject:
-		return extractFieldsFromArrayHolder(objectName, schema, locator)
+		return extractFieldsFromArrayHolder(objectName, schema, locator, propertyFlattener)
 	case schemaTypeArray:
-		return extractFieldsFromArray(objectName, schema)
+		return extractFieldsFromArray(objectName, schema, propertyFlattener)
 	case schemaTypeUnknown:
 		// Even though OpenAPI doesn't explicitly state that the schema is of object type,
 		// Attempt to process it as such.
 		// It seems that some OpenAPI files are not that strict about such things. Ex: Pipedrive, Zendesk.
-		return extractFieldsFromArrayHolder(objectName, schema, locator)
+		return extractFieldsFromArrayHolder(objectName, schema, locator, propertyFlattener)
 	default:
-		return nil, createUnprocessableObjectError(objectName)
+		return nil, "", createUnprocessableObjectError(objectName)
 	}
 }
 
@@ -148,7 +152,8 @@ func extractObjectFields(objectName string, schema *openapi3.Schema, locator Obj
 // to determine what is the name of property with respect to the object name.
 func extractFieldsFromArrayHolder(
 	objectName string, schema *openapi3.Schema, locator ObjectArrayLocator,
-) ([]string, error) {
+	propertyFlattener PropertyFlattener,
+) (fields []string, location string, err error) {
 	definitions := []openapi3.Schemas{
 		schema.Properties,
 	}
@@ -165,7 +170,12 @@ func extractFieldsFromArrayHolder(
 				// Now ask the discriminator if this is the target List.
 				// It is possible that response has multiple arrays, that's why we are asking to resolve ambiguity.
 				if locator(objectName, name) {
-					return extractFields(items.Value)
+					fields, err = extractFields(objectName, propertyFlattener, items.Value)
+					if err != nil {
+						return nil, "", err
+					}
+
+					return fields, name, nil
 				}
 			}
 		}
@@ -174,20 +184,25 @@ func extractFieldsFromArrayHolder(
 	if isBooleanTruthful(schema.AdditionalProperties.Has) {
 		// this schema is dynamic.
 		// the fields cannot be known.
-		return []string{}, nil
+		return []string{}, "", nil
 	}
 
-	return nil, createUnprocessableObjectError(objectName)
+	return nil, "", createUnprocessableObjectError(objectName)
 }
 
 // Response schema is an array itself. Collect fields that describe single item.
-func extractFieldsFromArray(objectName string, schema *openapi3.Schema) ([]string, error) {
+func extractFieldsFromArray(
+	objectName string, schema *openapi3.Schema,
+	propertyFlattener PropertyFlattener,
+) (fields []string, location string, err error) {
 	items, ok := getItems(schema.NewRef())
 	if !ok {
-		return nil, createUnprocessableObjectError(objectName)
+		return nil, "", createUnprocessableObjectError(objectName)
 	}
 
-	return extractFields(items.Value)
+	fields, err = extractFields(objectName, propertyFlattener, items.Value)
+
+	return fields, "", err
 }
 
 func getItems(schema *openapi3.SchemaRef) (*openapi3.SchemaRef, bool) {
@@ -214,7 +229,7 @@ func getQueryParameters(operation *openapi3.Operation) []string {
 	return queryParams
 }
 
-func extractSchema(operation *openapi3.Operation) *openapi3.Schema {
+func extractSchema(operation *openapi3.Operation, mime string) *openapi3.Schema {
 	if operation == nil {
 		return nil
 	}
@@ -235,7 +250,7 @@ func extractSchema(operation *openapi3.Operation) *openapi3.Schema {
 		return nil
 	}
 
-	mediaType := value.Content.Get("application/json")
+	mediaType := value.Content.Get(mime)
 	if mediaType == nil {
 		return nil
 	}
@@ -253,7 +268,10 @@ func extractSchema(operation *openapi3.Operation) *openapi3.Schema {
 	return schemaValue
 }
 
-func extractFields(source *openapi3.Schema) ([]string, error) {
+func extractFields(
+	objectName string,
+	propertyFlattener PropertyFlattener, source *openapi3.Schema,
+) ([]string, error) {
 	combined := make(datautils.Set[string])
 
 	if source.AnyOf != nil {
@@ -261,7 +279,7 @@ func extractFields(source *openapi3.Schema) ([]string, error) {
 		// we merge those fields to represent the whole domain of possible fields
 		// of course omitting duplicates.
 		for _, ref := range source.AnyOf {
-			fields, err := extractFields(ref.Value)
+			fields, err := extractFields(objectName, propertyFlattener, ref.Value)
 			if err != nil {
 				return nil, err
 			}
@@ -274,7 +292,7 @@ func extractFields(source *openapi3.Schema) ([]string, error) {
 	for _, ref := range source.AllOf {
 		parentValue := ref.Value
 		if parentValue != nil {
-			fields, err := extractFields(parentValue)
+			fields, err := extractFields(objectName, propertyFlattener, parentValue)
 			if err != nil {
 				return nil, err
 			}
@@ -284,8 +302,19 @@ func extractFields(source *openapi3.Schema) ([]string, error) {
 	}
 
 	// properties local to this schema
-	for property := range source.Properties {
-		combined.AddOne(property)
+	for property, propertySchema := range source.Properties {
+		if propertyFlattener(objectName, property) {
+			// This property holds an array, and we need nested fields to be moved one level up.
+			fields, err := extractFields(objectName, propertyFlattener, propertySchema.Value)
+			if err != nil {
+				return nil, err
+			}
+
+			combined.Add(fields)
+		} else {
+			// This is just a normal usual case where top level fields are collected as is.
+			combined.AddOne(property)
+		}
 	}
 
 	return combined.List(), nil

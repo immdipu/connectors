@@ -77,7 +77,11 @@ func (e Explorer) ReadObjects(
 
 	for _, path := range e.GetPathItems(pathMatcher, objectEndpoints) {
 		schema, found, err := path.RetrieveSchemaOperation(operationName,
-			displayNameOverride, locator, e.displayPostProcessing, e.parameterFilter,
+			displayNameOverride, locator,
+			e.displayPostProcessing,
+			e.operationMethodFilter,
+			e.propertyFlattener,
+			e.mediaType,
 		)
 		if err != nil {
 			return nil, err
