@@ -16,6 +16,7 @@ const (
 )
 
 var supportedObjectsByRead = datautils.NewSet( //nolint:gochecknoglobals
+	objectNameBroadCasts,
 	objectNameCustomFields,
 	objectNameEmailTemplates,
 	objectNameTags,
